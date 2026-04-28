@@ -29,6 +29,7 @@ dist/
 # Contienen evidencias de video, fotos y la DB con datos reales
 # =========================
 app/data/
+app/docs/
 
 # =========================
 # Secretos

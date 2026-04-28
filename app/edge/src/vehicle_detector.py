@@ -4,7 +4,7 @@ import os
 import numpy as np
 import base64
 from dotenv import load_dotenv
-from infraction_generator import generate_random_infraction # Importar la función de generación de infracciones
+from infraction_logic import evaluate_infractions # Importar la función de lógica real
 from collections import deque # Para el búfer de frames
 import re # Para validación de formato de placa
 import datetime # Para generar nombres de archivo únicos
@@ -13,35 +13,23 @@ from database_manager import init_db, save_infraction_metadata, export_infractio
 import random
 import time # Agregado para manejo de tiempo
 import argparse # Para aceptar video fuente por consola
+import json # Para leer configuraciones
+import imageio # Para codificar H264 de forma nativa
 
 
 import subprocess  # ya debe estar importado si no, agrégalo
 
 def reencode_to_h264(input_path, output_path):
     """
-    Reencoda un video a formato H.264 (libx264 + AAC) para asegurar compatibilidad con navegadores.
+    Función deprecada. Ahora se usa imageio para guardar directamente en H.264.
     """
-    command = [
-        'ffmpeg',
-        '-y',  # sobrescribe
-        '-i', input_path,
-        '-vcodec', 'libx264',
-        '-acodec', 'aac',
-        '-strict', 'experimental',
-        output_path
-    ]
-    try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
-        print(f"[ERROR] Falló reencodeo de {input_path}")
-        return False
+    pass
 
 
 # ================================
 # CONFIGURACIÓN DE MODO
 # ================================
-MODE = "real"  # Cambiar a "real" para usar OpenAI
+MODE = "test"  # Cambiado a "test" para rendimiento fluido sin llamadas bloqueantes a OpenAI
 
 if MODE == "real":
     from openai import OpenAI
@@ -204,6 +192,22 @@ def detect_vehicles_plates_and_ocr(vehicle_model_path: str, plate_model_path: st
     if isinstance(video_source, str) and video_source.isdigit():
         video_source = int(video_source)
         
+    # Cargar la configuración del video
+    config = None
+    config_file = os.path.join(app_root, 'data', 'video_configs.json')
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            try:
+                configs = json.load(f)
+                video_basename = os.path.basename(str(video_source))
+                config = configs.get(video_basename)
+                if config:
+                    print(f"[INFO] Configuración de ROIs cargada para {video_basename}")
+                else:
+                    print(f"[WARNING] No hay configuración de ROIs para {video_basename}.")
+            except Exception as e:
+                print(f"[ERROR] Al leer video_configs.json: {e}")
+        
     print(f"[INFO] Inicializando captura desde: {video_source}")
     cap = cv2.VideoCapture(video_source)
 
@@ -254,7 +258,8 @@ def detect_vehicles_plates_and_ocr(vehicle_model_path: str, plate_model_path: st
         current_time = time.time()
 
         # --- Detección y seguimiento de vehículos ---
-        vehicle_results = vehicle_model.track(frame, persist=True, tracker='bytetrack.yaml', verbose=False)
+        custom_tracker_path = os.path.join(app_root, 'edge', 'custom_tracker.yaml')
+        vehicle_results = vehicle_model.track(frame, persist=True, tracker=custom_tracker_path, verbose=False)
 
         if vehicle_results[0].boxes and vehicle_results[0].boxes.id is not None:
             boxes = vehicle_results[0].boxes.xyxy.cpu().numpy()
@@ -300,109 +305,116 @@ def detect_vehicles_plates_and_ocr(vehicle_model_path: str, plate_model_path: st
                     time_since_detection = current_time - vehicle_info['first_detection_time']
                     if not vehicle_info['ocr_ready'] and time_since_detection >= OCR_WAIT_TIME_SECONDS:
                         vehicle_info['ocr_ready'] = True
-                        print(f"[INFO] Vehículo ID {track_id} listo para OCR tras {OCR_WAIT_TIME_SECONDS}s de estabilización.")
+                        print(f"[INFO] Vehículo ID {track_id} listo para evaluación de infracciones.")
 
-                    # --- Detección de placas dentro del ROI del vehículo ---
-                    vehicle_roi = frame[y1_v:y2_v, x1_v:x2_v]
-                    if vehicle_roi.shape[0] > 0 and vehicle_roi.shape[1] > 0:
-                        plate_results = plate_model(vehicle_roi, stream=True, verbose=False)
-                        for r_plate in plate_results:
-                            if r_plate.boxes:
-                                for p_box in r_plate.boxes:
-                                    x1_p, y1_p, x2_p, y2_p = map(int, p_box.xyxy[0])
-                                    x1_p_abs, y1_p_abs = x1_p + x1_v, y1_p + y1_v
-                                    x2_p_abs, y2_p_abs = x2_p + x1_v, y2_p + y1_v
-                                    
-                                    cv2.rectangle(frame, (x1_p_abs, y1_p_abs), (x2_p_abs, y2_p_abs), (255, 0, 0), 2)
-
-                                    # Almacenar la ROI de la placa más reciente (para usar después del tiempo de espera)
-                                    plate_roi = vehicle_roi[y1_p:y2_p, x1_p:x2_p]
-                                    if plate_roi.shape[0] > 10 and plate_roi.shape[1] > 10:  # Verificar tamaño mínimo
-                                        vehicle_info['latest_plate_roi'] = plate_roi.copy()
-
-                                    # --- Lógica de Infracción y OCR (solo después del tiempo de espera) ---
-                                    if vehicle_info['ocr_ready'] and vehicle_info['infraction'] is None and not vehicle_info['waiting_for_ocr']:
-                                        vehicle_info['waiting_for_ocr'] = True
-                                        print(f"[INFO] Iniciando evaluación de infracción para vehículo ID {track_id}...")
-                                        
-                                        infraction_status = generate_random_infraction()
-                                        vehicle_info['infraction'] = infraction_status
-                                        
-                                        if infraction_status['has_infraction']:
-                                            print(f"\n¡INFRACCIÓN DETECTADA! Vehículo ID {track_id} - Tipo: {infraction_status['type']}")
-                                            print(f"[INFO] Procesando OCR con imagen estabilizada...")
+                    # --- Lógica de Infracción y OCR (Optimizada) ---
+                    if vehicle_info['ocr_ready'] and vehicle_info['infraction'] is None and not vehicle_info['waiting_for_ocr']:
+                        
+                        # Evaluar infracción con lógica real
+                        vehicle_bbox = [x1_v, y1_v, x2_v, y2_v]
+                        infraction_status = evaluate_infractions(track_id, vehicle_info, vehicle_bbox, config, frame)
+                        
+                        if infraction_status is not None and infraction_status.get('has_infraction'):
+                            vehicle_info['waiting_for_ocr'] = True
+                            vehicle_info['infraction'] = infraction_status
+                            print(f"\n¡INFRACCIÓN DETECTADA! Vehículo ID {track_id} - Tipo: {infraction_status['type']}")
+                            print(f"[INFO] Buscando placa y procesando OCR...")
+                            
+                            # --- Detección de placas (SOLO CUANDO HAY INFRACCIÓN) ---
+                            vehicle_roi = frame[y1_v:y2_v, x1_v:x2_v]
+                            best_plate_roi = None
+                            if vehicle_roi.shape[0] > 0 and vehicle_roi.shape[1] > 0:
+                                plate_results = plate_model(vehicle_roi, stream=True, verbose=False)
+                                for r_plate in plate_results:
+                                    if r_plate.boxes:
+                                        for p_box in r_plate.boxes:
+                                            x1_p, y1_p, x2_p, y2_p = map(int, p_box.xyxy[0])
+                                            # Dibujar la placa
+                                            x1_p_abs, y1_p_abs = x1_p + x1_v, y1_p + y1_v
+                                            x2_p_abs, y2_p_abs = x2_p + x1_v, y2_p + y1_v
+                                            cv2.rectangle(frame, (x1_p_abs, y1_p_abs), (x2_p_abs, y2_p_abs), (255, 0, 0), 2)
                                             
-                                            # OCR según el modo, usando la ROI más reciente y estable
-                                            if MODE == "real" and vehicle_info['latest_plate_roi'] is not None:
-                                                # Modo real: usar OpenAI con la imagen estabilizada
-                                                processed_roi = preprocess_plate_roi(vehicle_info['latest_plate_roi'])
-                                                _, buffer = cv2.imencode('.jpg', processed_roi)
-                                                base64_encoded = base64.b64encode(buffer).decode('utf-8')
-                                                ocr_result = extract_text_openai(base64_encoded)
-                                                final_plate_text = ocr_result['plate_text']
-                                                final_confidence = ocr_result['confidence']  # Usar el confidence de OpenAI
-                                                print(f"  OCR Confidence: {final_confidence:.3f}")
-                                            else:
-                                                # Modo prueba: usar datos fijos
-                                                test_plates = ["A1B-123", "C2D-456", "E3F-789", "G4H-012"]
-                                                final_plate_text = random.choice(test_plates)
-                                                final_confidence = 0.9  # Confianza fija en modo prueba
-                                            
-                                            vehicle_info['plate_text'] = final_plate_text
-                                            vehicle_info['ocr_confidence'] = final_confidence  # Guardar el confidence correcto
-                                            print(f"  Placa detectada: {final_plate_text}. Iniciando captura de {POST_INFRACTION_CONTEXT_SECONDS}s post-infracción.")
+                                            plate_roi = vehicle_roi[y1_p:y2_p, x1_p:x2_p]
+                                            if plate_roi.shape[0] > 10 and plate_roi.shape[1] > 10:
+                                                best_plate_roi = plate_roi.copy()
+                                            break # Tomar solo la primera placa encontrada
+                                    if best_plate_roi is not None:
+                                        break
+                            
+                            # OCR según el modo
+                            if MODE == "real" and best_plate_roi is not None:
+                                # Modo real: usar OpenAI
+                                processed_roi = preprocess_plate_roi(best_plate_roi)
+                                _, buffer = cv2.imencode('.jpg', processed_roi)
+                                base64_encoded = base64.b64encode(buffer).decode('utf-8')
+                                ocr_result = extract_text_openai(base64_encoded)
+                                final_plate_text = ocr_result['plate_text']
+                                final_confidence = ocr_result['confidence']
+                                print(f"  OCR Confidence: {final_confidence:.3f}")
+                            else:
+                                # Modo prueba o no se encontró placa
+                                test_plates = ["A1B-123", "C2D-456", "E3F-789", "G4H-012"]
+                                final_plate_text = random.choice(test_plates) if best_plate_roi is not None else "NO_PLATE"
+                                final_confidence = 0.9 if best_plate_roi is not None else 0.0
+                            
+                            vehicle_info['plate_text'] = final_plate_text
+                            vehicle_info['ocr_confidence'] = final_confidence
+                            print(f"  Placa detectada: {final_plate_text}. Iniciando captura de {POST_INFRACTION_CONTEXT_SECONDS}s post-infracción.")
 
-                                            # Marcar para grabación en lugar de guardar el video inmediatamente
-                                            vehicle_info['is_recording_clip'] = True
-                                            vehicle_info['infraction_frame_number'] = frame_count
-                                            
-                                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                                            infraction_type = infraction_status['type'] or "UNKNOWN"
-                                            # Usar solo la placa limpia para el nombre del archivo
-                                            base_filename = f"infraction_{timestamp}_ID{track_id}_{infraction_type}_{final_plate_text}"
-                                            vehicle_info['base_filename'] = base_filename
+                            # Marcar para grabación en lugar de guardar el video inmediatamente
+                            vehicle_info['is_recording_clip'] = True
+                            vehicle_info['infraction_frame_number'] = frame_count
+                            
+                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            infraction_type = infraction_status['type'].replace(" ", "_")
+                            # Usar solo la placa limpia para el nombre del archivo
+                            base_filename = f"infraction_{timestamp}_ID{track_id}_{infraction_type}_{final_plate_text}"
+                            vehicle_info['base_filename'] = base_filename
 
-                                            # Guardar el frame de la infracción
-                                            image_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{base_filename}.jpg")
-                                            cv2.imwrite(image_filename, frame)
-                                            print(f"  Frame de infracción guardado: {os.path.basename(image_filename)}")
+                            # Guardar el frame de la infracción
+                            image_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{base_filename}.jpg")
+                            cv2.imwrite(image_filename, frame)
+                            print(f"  Frame de infracción guardado: {os.path.basename(image_filename)}")
 
-                                            # Crear y guardar el thumbnail
-                                            thumbnail_image = create_thumbnail(frame)
-                                            thumbnail_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{base_filename}_thumbnail.jpg")
-                                            cv2.imwrite(thumbnail_filename, thumbnail_image)
-                                            print(f"  Thumbnail guardado: {os.path.basename(thumbnail_filename)}")
+                            # Crear y guardar el thumbnail
+                            thumbnail_image = create_thumbnail(frame)
+                            thumbnail_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{base_filename}_thumbnail.jpg")
+                            cv2.imwrite(thumbnail_filename, thumbnail_image)
+                            print(f"  Thumbnail guardado: {os.path.basename(thumbnail_filename)}")
 
-                                            # GUARDADO EN BASE DE DATOS EN TIEMPO REAL
-                                            if not vehicle_info['db_saved']:
-                                                print(f"  [DB] Guardando infracción en base de datos...")
-                                                video_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{base_filename}.mp4")
-                                                save_infraction_metadata(
-                                                    timestamp=timestamp,
-                                                    plate_number=final_plate_text,  # Solo la placa limpia
-                                                    camera_id=1,  # ID fijo para la cámara del prototipo
-                                                    rule_id=infraction_status['rule_id'],
-                                                    confidence=final_confidence,  # Usar el confidence de OpenAI
-                                                    image_path=image_filename,
-                                                    video_path=video_filename,
-                                                    thumbnail_path=thumbnail_filename
-                                                )
-                                                vehicle_info['db_saved'] = True
-                                                print(f"  [DB] Infracción guardada en base de datos para placa {final_plate_text}")
-                                        else:
-                                            vehicle_info['plate_text'] = "NO INFRACTION"
-                                            print(f"[INFO] Vehículo ID {track_id} sin infracción detectada.")
+                            # GUARDADO EN BASE DE DATOS EN TIEMPO REAL
+                            if not vehicle_info['db_saved']:
+                                print(f"  [DB] Guardando infracción en base de datos...")
+                                video_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{base_filename}.mp4")
+                                save_infraction_metadata(
+                                    timestamp=timestamp,
+                                    plate_number=final_plate_text,  # Solo la placa limpia
+                                    camera_id=1,  # ID fijo para la cámara del prototipo
+                                    rule_id=infraction_status['rule_id'],
+                                    confidence=final_confidence,  # Usar el confidence de OpenAI
+                                    image_path=image_filename,
+                                    video_path=video_filename,
+                                    thumbnail_path=thumbnail_filename
+                                )
+                                vehicle_info['db_saved'] = True
+                                print(f"  [DB] Infracción guardada en base de datos para placa {final_plate_text}")
+                        else:
+                            vehicle_info['plate_text'] = "None" # Aún evaluando, pero sin infracción
 
-                                    # --- Lógica de visualización de texto ---
-                                    if vehicle_info['ocr_ready']:
-                                        display_text = f"OCR: {vehicle_info['plate_text'] or 'Processing...'}"
-                                        if vehicle_info['infraction'] and vehicle_info['infraction']['has_infraction']:
-                                            display_text += f" | INF: {vehicle_info['infraction']['type']}"
-                                    else:
-                                        remaining_time = OCR_WAIT_TIME_SECONDS - time_since_detection
-                                        display_text = f"Estabilizando... {remaining_time:.1f}s"
-                                    
-                                    cv2.putText(frame, display_text, (x1_p_abs, y2_p_abs + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    # --- Lógica de visualización de texto ---
+                    # Determinar posición del texto: usar la posición de la placa si existe, sino la del vehículo
+                    text_x = x1_v
+                    text_y = y2_v + 20
+                    
+                    if vehicle_info['ocr_ready']:
+                        display_text = f"OCR: {vehicle_info['plate_text'] or 'Processing...'}"
+                        if vehicle_info['infraction'] and vehicle_info['infraction']['has_infraction']:
+                            display_text += f" | INF: {vehicle_info['infraction']['type']}"
+                    else:
+                        remaining_time = OCR_WAIT_TIME_SECONDS - time_since_detection
+                        display_text = f"Estabilizando... {remaining_time:.1f}s"
+                    
+                    cv2.putText(frame, display_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # Añadir el frame actual al búfer principal, usando .copy() para seguridad
         main_frame_buffer.append(frame.copy())
@@ -419,31 +431,51 @@ def detect_vehicles_plates_and_ocr(vehicle_model_path: str, plate_model_path: st
                         print(f"  Advertencia: Buffer incompleto ({len(frames_to_save)}/{total_clip_frames} frames). El video podría ser más corto.")
 
                     video_filename = os.path.join(INFRACTIONS_SAVE_DIR, f"{info['base_filename']}.mp4")
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    out = cv2.VideoWriter(video_filename, fourcc, fps, (frame_width, frame_height))
-                    for f in frames_to_save:
-                        out.write(f)
-                    out.release()
-                    print(f"  [✔] Clip de video de {CLIP_DURATION_SECONDS}s guardado: {os.path.basename(video_filename)}")
-                    # Reencodificar el video a H.264 + AAC
-                    temp_path = os.path.join(INFRACTIONS_SAVE_DIR, f"{info['base_filename']}_h264.mp4")
-                    if reencode_to_h264(video_filename, temp_path):
-                        os.remove(video_filename)
-                        os.rename(temp_path, video_filename)
-                        print(f"  [✔] Video reencodeado a formato compatible: {os.path.basename(video_filename)}")
-                    else:
-                        print(f"  [⚠️] Se usará el video original sin reencodeo.")
+                    try:
+                        # Guardar directamente en H.264 usando imageio
+                        writer = imageio.get_writer(video_filename, fps=fps, codec='libx264', format='FFMPEG')
+                        for f in frames_to_save:
+                            # OpenCV usa BGR, imageio espera RGB
+                            rgb_frame = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+                            writer.append_data(rgb_frame)
+                        writer.close()
+                        print(f"  [✔] Clip de video de {CLIP_DURATION_SECONDS}s guardado en formato web (H.264): {os.path.basename(video_filename)}")
+                    except Exception as e:
+                        print(f"  [ERROR] No se pudo guardar el video con imageio: {e}")
 
                     info['saved_evidence'] = True
                     info['is_recording_clip'] = False
 
+        # Dibujar ROIs en pantalla si existen
+        if config:
+            lanes = config.get("lanes", [])
+            for lane in lanes:
+                tl = lane.get("traffic_light_roi", [])
+                if len(tl) == 4:
+                    x, y, w, h = tl
+                    # Determinar si está en rojo para pintar el cuadro rojo o verde
+                    from infraction_logic import is_traffic_light_red
+                    color = (0, 0, 255) if is_traffic_light_red(frame, tl) else (0, 255, 0)
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                
+                sl = lane.get("stop_line", [])
+                if len(sl) == 2:
+                    cv2.line(frame, tuple(sl[0]), tuple(sl[1]), (0, 255, 255), 2)
+                    
+            cw = config.get("crosswalk_polygon", [])
+            if len(cw) > 0:
+                pts = np.array(cw, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(frame, [pts], True, (255, 0, 0), 2)
+
         cv2.imshow('Vehicle, Plate, Infraction and Optimized OCR', frame)
 
         # Simular tiempo real si estamos leyendo un video de archivo
+        # IMPORTANTE: Si es un video pre-grabado y queremos procesar rápido,
+        # quitamos el sleep. Esto evita perder IDs en el rastreador.
         elapsed_processing_time = time.time() - current_time
         target_frame_time = 1.0 / fps
-        if elapsed_processing_time < target_frame_time:
-            time.sleep(target_frame_time - elapsed_processing_time)
+        # if elapsed_processing_time < target_frame_time:
+        #     time.sleep(target_frame_time - elapsed_processing_time)
 
         # Usar waitKey con 1ms en lugar de target_frame_time para que reaccione rápido a la 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
